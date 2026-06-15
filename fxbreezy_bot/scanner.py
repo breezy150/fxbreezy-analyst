@@ -259,25 +259,51 @@ def fmt_price(x: float, pip: float) -> str:
     digits = 0 if x >= 1000 else (2 if pip >= 0.1 else (3 if pip >= 0.01 else 5))
     return f"{x:.{digits}f}"
 
+SEP = "━" * 18
+
+def sym_disp(name: str) -> str:
+    return f"{name[:3]}/{name[3:]}" if len(name) == 6 else name
+
+def pbar(pct: float, n: int = 10) -> str:
+    pct = max(0.0, min(100.0, pct))
+    fill = int(round(pct / 100 * n))
+    return "█" * fill + "░" * (n - fill)
+
+def fmt_dt(ts) -> str:
+    try:
+        d = pd.Timestamp(ts).to_pydatetime()
+    except Exception:
+        d = dt.datetime.now(dt.timezone.utc)
+    return d.strftime("%d %b %Y | %H:%M")
+
+def fmt_dur(a, b) -> str:
+    try:
+        secs = (pd.Timestamp(b) - pd.Timestamp(a)).total_seconds()
+        m = int(secs // 60)
+        return f"{m // 60}h {m % 60}m"
+    except Exception:
+        return "—"
+
 def build_alert(name, tf, direction, sig, tp1, tp2, rr2, conf, pip, bias_txt,
                 invalidation) -> str:
-    head = "🟢 BUY SIGNAL" if direction == "BUY" else "🔴 SELL SIGNAL"
     p = lambda v: fmt_price(v, pip)
-    sl = session_label()
-    sess_line = f"{sl} Session" if sl else "Outside main sessions"
-    pa = "Bullish PA" if direction == "BUY" else "Bearish PA"
+    pos = "🟢 BUY POSITION" if direction == "BUY" else "🔴 SELL POSITION"
     return (
-        f"{head} — {name} ({tf})\n"
-        f"📍 Entry: {p(sig['entry'])}\n"
-        f"🛑 Stop Loss: {p(sig['sl'])}\n"
-        f"🎯 TP1: {p(tp1)}\n"
-        f"🎯 TP2: {p(tp2)}\n"
-        f"📊 R:R — 1:{rr2:.1f}\n"
-        f"⏰ {sess_line}\n"
-        f"✅ Confirmed — High Volume + {pa} ({sig['kind']})\n"
-        f"📈 Bias: {bias_txt}\n"
-        f"⚠️ Invalidation: {invalidation}\n"
-        f"🎯 Confidence: {conf}%"
+        f"{SEP}\n⚡ FxBreezy SIGNAL\n{SEP}\n\n"
+        f"📌 {sym_disp(name)}\n{pos}\n\n"
+        f"{SEP}\n📍 TRADE LEVELS\n{SEP}\n\n"
+        f"Entry:\n{p(sig['entry'])}\n\n"
+        f"🛑 Stop Loss:\n{p(sig['sl'])}\n(Risk: 1R)\n\n"
+        f"🎯 Target 1:\n{p(tp1)}\n(+1R)\n\n"
+        f"🏆 Target 2:\n{p(tp2)}\n(+2R)\n\n"
+        f"{SEP}\n📊 TRADE STATUS\n{SEP}\n\n"
+        f"Status:\n🟢 ACTIVE\n\n"
+        f"Progress:\n{pbar(0)} 0%\n\n"
+        f"Current:\n+0.0R\n\n"
+        f"Protection:\n🔓 SL active (Risk 1R)\n\n"
+        f"{SEP}\n⏱ Monitoring:\n{tf} Candle Scan\n\n"
+        f"🕒 Opened:\n{fmt_dt(dt.datetime.now(dt.timezone.utc))}\n\n"
+        f"#FxBreezy #{name}\n{SEP}"
     )
 
 # ── per-symbol analysis ─────────────────────────────────────────────────────
@@ -428,19 +454,42 @@ def record_trade(setup: dict) -> None:
     save_json(TRADES, trades)
 
 def _tp1_msg(t):
-    return (f"🎯 TP1 HIT — {t['symbol']} {t['direction']}\n"
-            f"First target reached (+1R). Stop moved to breakeven ({fmt_price(t['entry'], t['pip'])}).\n"
-            f"Now targeting TP2 {fmt_price(t['tp2'], t['pip'])}.")
+    s = sym_disp(t["symbol"])
+    return (
+        f"{SEP}\n🎯 TARGET REACHED\n{SEP}\n\n"
+        f"{s}\n{t['direction']}\n\n"
+        f"{SEP}\nFIRST TARGET HIT ✅\n\n"
+        f"Profit:\n+1R\n\n"
+        f"Action Taken:\n🔒 Stop Loss moved to BE\n\n"
+        f"New Risk:\n0R\n\n"
+        f"{SEP}\nTrade Protection:\n{pbar(100)} 100%\n\n"
+        f"Waiting for:\n🏆 TP2 (+2R)\n\n"
+        f"#FxBreezy\n{SEP}"
+    )
 
 def _close_msg(t):
-    r = t["result"]
+    s = sym_disp(t["symbol"]); d = t["direction"]; r = t["result"]
+    dur = fmt_dur(t.get("opened_at"), t.get("closed_at"))
     if r == "win":
-        head = f"✅ WIN — {t['symbol']} {t['direction']} hit TP2  (+2R)"
-    elif r == "loss":
-        head = f"🛑 LOSS — {t['symbol']} {t['direction']} hit stop  (-1R)"
-    else:
-        head = f"⚪ BREAKEVEN — {t['symbol']} {t['direction']} stopped at entry after TP1  (0R)"
-    return head + f"\nExit {fmt_price(t['exit_price'], t['pip'])}  ·  opened {t['opened_at'][:16]}Z"
+        return (
+            f"{SEP}\n🏆 TRADE CLOSED\n{SEP}\n\n{s}\n{d}\n\n{SEP}\n\n"
+            f"Result:\n✅ WIN\n\nPerformance:\n+2.0R\n\n{SEP}\n"
+            f"Trade Journey:\n\nEntry\n  ↓\n🎯 TP1\n  ↓\n🏆 TP2\n\n{SEP}\n\n"
+            f"Duration:\n{dur}\n\n#FxBreezy\n{SEP}"
+        )
+    if r == "loss":
+        return (
+            f"{SEP}\n🛑 TRADE CLOSED\n{SEP}\n\n{s}\n{d}\n\n{SEP}\n\n"
+            f"Result:\nLOSS\n\nDamage:\n-1.0R\n\n{SEP}\n\n"
+            f"Trade Review:\n\nEntry ❌\nSL Hit\n\nRisk Controlled:\n1R\n\n{SEP}\n\n"
+            f"Next setup loading...\n\n#FxBreezy\n{SEP}"
+        )
+    return (
+        f"{SEP}\n⚪ PROTECTED EXIT\n{SEP}\n\n{s}\n{d}\n\n{SEP}\n\n"
+        f"Result:\nBREAKEVEN\n\nReturn:\n0R\n\n{SEP}\n\n"
+        f"Trade Flow:\n\nEntry\n ↓\n🎯 TP1 Hit\n ↓\n🔒 Protected\n ↓\nExit\n\n{SEP}\n\n"
+        f"Capital Protected ✅\n\n#FxBreezy\n{SEP}"
+    )
 
 def monitor_trades(dry: bool = False) -> int:
     trades = load_json(TRADES, [])
@@ -494,16 +543,91 @@ def portfolio_summary() -> str:
     decisive = len(wins) + len(loss)
     wr = (len(wins) / decisive * 100) if decisive else 0
     net = sum(t.get("r_multiple", 0) for t in closed)
-    lines = [
-        "📊 FxBreezy PORTFOLIO",
-        f"Closed: {len(closed)}   ✅ {len(wins)}W  🛑 {len(loss)}L  ⚪ {len(be)}BE",
-        f"Win rate: {wr:.0f}%   Net: {net:+.1f}R",
-        f"Open trades: {len(opn)}",
-    ]
-    for t in opn:
-        st = "TP1✓ (BE)" if t["tp1_hit"] else "running"
-        lines.append(f"  • {t['symbol']} {t['direction']} @ {fmt_price(t['entry'], t['pip'])} — {st}")
-    return "\n".join(lines)
+    active_risk = sum(0 if t["tp1_hit"] else 1 for t in opn)
+    return (
+        "╔══════════════════╗\n   📊 FxBreezy\n   PORTFOLIO\n╚══════════════════╝\n\n\n"
+        "📅 Performance Overview\n\n"
+        f"Trades Closed:\n{len(closed)}\n\n{SEP}\n\n"
+        f"🟢 Wins:\n{len(wins)}\n\n🔴 Losses:\n{len(loss)}\n\n⚪ Breakeven:\n{len(be)}\n\n\n{SEP}\n\n"
+        f"🎯 Win Rate\n\n{pbar(wr)}\n\n{wr:.0f}%\n\n\n{SEP}\n\n"
+        f"💰 Net Performance\n\n{net:+.1f}R\n\n\n{SEP}\n\n"
+        f"📂 Current Exposure\n\nOpen Trades:\n{len(opn)}\n\n\nActive Risk:\n{active_risk}R\n\n\n{SEP}\n\n"
+        f"🔥 Trading Status\n\nSYSTEM:\n🟢 Healthy\n\nLast Update:\n{fmt_dt(dt.datetime.now(dt.timezone.utc))[:11]}\n{SEP}"
+    )
+
+def stats_dashboard() -> str:
+    trades = load_json(TRADES, [])
+    closed = [t for t in trades if t["status"] == "closed" and t.get("closed_at")]
+    now = dt.datetime.now(dt.timezone.utc)
+    today = now.date()
+
+    def cdate(t):
+        try:
+            return pd.Timestamp(t["closed_at"]).to_pydatetime().astimezone(dt.timezone.utc).date()
+        except Exception:
+            return None
+
+    td = [t for t in closed if cdate(t) == today]
+    wk = [t for t in closed if cdate(t) and (today - cdate(t)).days < 7]
+    mo = [t for t in closed if cdate(t) and cdate(t).year == today.year and cdate(t).month == today.month]
+
+    def winrate(ts):
+        w = sum(1 for t in ts if t["result"] == "win")
+        l = sum(1 for t in ts if t["result"] == "loss")
+        return (w / (w + l) * 100) if (w + l) else 0
+
+    td_w = sum(1 for t in td if t["result"] == "win")
+    td_l = sum(1 for t in td if t["result"] == "loss")
+    td_pl = sum(t.get("r_multiple", 0) for t in td)
+    mo_net = sum(t.get("r_multiple", 0) for t in mo)
+    opn = [t for t in trades if t["status"] in ("open", "tp1")]
+    return (
+        "📊 FxBreezy Live Dashboard\n\n"
+        f"Today:\nTrades: {len(td)}\nWins: {td_w}\nLosses: {td_l}\n\n"
+        f"Today P/L:\n{td_pl:+.0f}R\n\n\n"
+        f"This Week:\nWin Rate:\n{winrate(wk):.0f}%\n\n"
+        f"Monthly:\n{mo_net:+.1f}R\n\n\n"
+        f"Current:\n{len(opn)} Open Trades"
+    )
+
+def listen():
+    """Long-poll Telegram and reply to /stats and /summary commands. Runs forever."""
+    tok, chat = creds()
+    if not (tok and chat):
+        log("listen: no creds")
+        return
+    base = f"https://api.telegram.org/bot{tok}"
+    off_file = os.path.join(BASE, "tg_offset.txt")
+    try:
+        offset = int(open(off_file).read().strip())
+    except Exception:
+        offset = 0
+    log("listener started — commands: /stats /summary /help")
+    while True:
+        try:
+            url = f"{base}/getUpdates?timeout=50" + (f"&offset={offset}" if offset else "")
+            with urllib.request.urlopen(url, timeout=70) as r:
+                data = json.loads(r.read().decode())
+            for upd in data.get("result", []):
+                offset = upd["update_id"] + 1
+                try:
+                    open(off_file, "w").write(str(offset))
+                except Exception:
+                    pass
+                msg = upd.get("message") or {}
+                text = (msg.get("text") or "").strip().lower()
+                cid = str((msg.get("chat") or {}).get("id"))
+                if cid != str(chat):
+                    continue
+                if text.startswith("/stats"):
+                    send_telegram(stats_dashboard())
+                elif text.startswith("/summary"):
+                    send_telegram(portfolio_summary())
+                elif text.startswith(("/start", "/help")):
+                    send_telegram("🤖 FxBreezy bot online.\nCommands:\n/stats — live dashboard\n/summary — full portfolio")
+        except Exception as e:
+            log(f"listen error: {e}")
+            time.sleep(5)
 
 # ── main scan ───────────────────────────────────────────────────────────────
 def run_scan(symbols=None, dry=False):
@@ -554,6 +678,8 @@ def main():
     ap.add_argument("--gap", action="store_true", help="run weekend-gap analysis instead of a scan")
     ap.add_argument("--monitor", action="store_true", help="only monitor open trades for TP/SL")
     ap.add_argument("--summary", action="store_true", help="send the portfolio summary and exit")
+    ap.add_argument("--stats", action="store_true", help="send the live /stats dashboard and exit")
+    ap.add_argument("--listen", action="store_true", help="long-poll Telegram for /stats /summary (runs forever)")
     ap.add_argument("--symbols", help="comma-separated subset, e.g. EURUSD,XAUUSD")
     args = ap.parse_args()
 
@@ -561,6 +687,10 @@ def main():
         ok = send_telegram("🤖 FxBreezy analyst online — scanner reachable and authorised.")
         log(f"ping sent ok={ok}")
         return
+    if args.listen:
+        listen(); return
+    if args.stats:
+        notify(stats_dashboard(), args.dry); return
     if args.summary:
         notify(portfolio_summary(), args.dry); return
     if args.monitor:

@@ -35,8 +35,18 @@ python scanner.py --dry                # analyse + print, never sends
 python scanner.py                      # monitor open trades + scan -> Telegram
 python scanner.py --symbols EURUSD,XAUUSD   # scan a subset
 python scanner.py --summary            # portfolio (W/L/win-rate/net R) -> Telegram
+python scanner.py --stats              # live /stats dashboard -> Telegram
 python scanner.py --monitor            # only check open trades for TP/SL hits
+python scanner.py --listen             # run the command listener (foreground, forever)
 ```
+
+## Live Telegram commands
+
+A listener (`--listen`, kept alive by the **FxBreezyListener** Windows task at logon)
+long-polls Telegram and replies to:
+- **/stats** — live dashboard (today / week / month / open trades)
+- **/summary** — full portfolio card
+- **/help** — command list
 
 ## Trade tracking & portfolio
 
