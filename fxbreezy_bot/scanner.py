@@ -298,10 +298,10 @@ def build_alert(name, tf, direction, sig, tp1, tp2, rr2, conf, pip, bias_txt,
         f"TP2: {p(tp2)} (+2R)\n\n"
         f"📊 Status: ACTIVE\n"
         f"Progress: {pbar(0, 8)} 0%\n"
-        f"Current: +0.0R\n\n"
+        f"Current: +0.0R\n"
         f"🛡 Protection: SL → BE\n"
         f"⏱ Scan: {tf}\n"
-        f"🕒 Open: {dt.datetime.now(dt.timezone.utc):%d %b %H:%M}\n\n"
+        f"🕒 Open: {dt.datetime.now(dt.timezone.utc):%d %b %H:%M}\n"
         f"#FxBreezy"
     )
 
@@ -454,12 +454,12 @@ def record_trade(setup: dict) -> None:
 
 def _tp1_msg(t):
     return (
-        f"🎯 FxBreezy UPDATE | {sym_disp(t['symbol'])}\n\n"
+        f"🎯 FxBreezy UPDATE | {sym_disp(t['symbol'])}\n"
         f"TP1 REACHED ✅\n\n"
         f"Profit: +1R\n"
-        f"Action: SL moved to BE 🔒\n\n"
+        f"Action: SL moved to BE 🔒\n"
         f"Status: RUNNING\n"
-        f"Next Target: TP2 (+2R)\n\n"
+        f"Next Target: TP2 (+2R)\n"
         f"📊 Trade Protection: 100%"
     )
 
@@ -467,29 +467,29 @@ def _close_msg(t):
     s = sym_disp(t["symbol"]); d = t["direction"]; r = t["result"]
     if r == "win":
         return (
-            f"🏆 FxBreezy RESULT | {s}\n\n"
+            f"🏆 FxBreezy RESULT | {s}\n"
             f"{d} CLOSED ✅\n\n"
             f"Outcome: WIN\n"
-            f"Return: +2.0R\n\n"
-            f"Trade:\nEntry → TP1 → TP2\n\n"
-            f"Duration: {fmt_dur(t.get('opened_at'), t.get('closed_at'))}\n\n"
+            f"Return: +2.0R\n"
+            f"Trade: Entry → TP1 → TP2\n"
+            f"Duration: {fmt_dur(t.get('opened_at'), t.get('closed_at'))}\n"
             f"#FxBreezy"
         )
     if r == "loss":
         return (
-            f"🛑 FxBreezy RESULT | {s}\n\n"
-            f"{d} CLOSED\n"
+            f"🛑 FxBreezy RESULT | {s}\n"
+            f"{d} CLOSED\n\n"
             f"Outcome: LOSS\n"
-            f"Return: -1.0R\n\n"
-            f"Reason:\nSL Hit\n\n"
+            f"Return: -1.0R\n"
+            f"Reason: SL Hit\n"
             f"Risk Managed: 1R"
         )
     return (
-        f"⚪ FxBreezy RESULT | {s}\n\n"
+        f"⚪ FxBreezy RESULT | {s}\n"
         f"Protected Exit\n\n"
         f"Outcome: BE\n"
-        f"Return: 0R\n\n"
-        f"Flow:\nEntry → TP1 → BE\n\n"
+        f"Return: 0R\n"
+        f"Flow: Entry → TP1 → BE\n"
         f"Capital Protected 🔒"
     )
 
@@ -548,14 +548,14 @@ def portfolio_summary() -> str:
     active_risk = sum(0 if t["tp1_hit"] else 1 for t in opn)
     return (
         f"📊 FxBreezy PORTFOLIO\n\n"
-        f"Closed Trades: {len(closed)}\n\n"
+        f"Closed Trades: {len(closed)}\n"
         f"✅ Wins: {len(wins)}\n"
         f"🛑 Losses: {len(loss)}\n"
         f"⚪ BE: {len(be)}\n\n"
         f"Win Rate: {wr:.0f}%\n"
         f"Net: {net:+.1f}R\n\n"
         f"Open Trades: {len(opn)}\n"
-        f"Risk: {active_risk}R\n\n"
+        f"Risk: {active_risk}R\n"
         f"System: 🟢 Healthy"
     )
 
@@ -588,9 +588,9 @@ def stats_dashboard() -> str:
     return (
         "📊 FxBreezy Live Dashboard\n\n"
         f"Today:\nTrades: {len(td)}\nWins: {td_w}\nLosses: {td_l}\n\n"
-        f"Today P/L:\n{td_pl:+.0f}R\n\n\n"
+        f"Today P/L:\n{td_pl:+.0f}R\n\n"
         f"This Week:\nWin Rate:\n{winrate(wk):.0f}%\n\n"
-        f"Monthly:\n{mo_net:+.1f}R\n\n\n"
+        f"Monthly:\n{mo_net:+.1f}R\n\n"
         f"Current:\n{len(opn)} Open Trades"
     )
 
