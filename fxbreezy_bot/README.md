@@ -32,9 +32,25 @@ pip install -r requirements.txt
 copy config.example.json config.json   # then paste token + chat id
 python scanner.py --ping               # sends a test message
 python scanner.py --dry                # analyse + print, never sends
-python scanner.py                      # real scan -> Telegram on a valid setup
+python scanner.py                      # monitor open trades + scan -> Telegram
 python scanner.py --symbols EURUSD,XAUUSD   # scan a subset
+python scanner.py --summary            # portfolio (W/L/win-rate/net R) -> Telegram
+python scanner.py --monitor            # only check open trades for TP/SL hits
 ```
+
+## Trade tracking & portfolio
+
+Every signal sent to Telegram is logged in `trades.json` (gitignored) as an open
+trade. Each scan cycle then monitors them on 30M candles and alerts on outcome:
+
+- **SL hit (before TP1)** → ❌ LOSS (−1R)
+- **TP1 hit** → 🎯 milestone alert; stop moves to **breakeven**
+- **TP2 hit** → ✅ WIN (+2R)
+- **stopped at entry after TP1** → ⚪ BREAKEVEN (0R)
+
+When a trade closes, an updated **portfolio summary** (wins / losses / win-rate /
+net R / open trades) is sent automatically. Pull it anytime with `--summary`.
+Same-bar SL+TP touches are scored pessimistically (stop first).
 
 ## Tuning
 

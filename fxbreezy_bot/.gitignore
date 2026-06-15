@@ -3,3 +3,4 @@ config.json
 .env
 *.log
 __pycache__/
+trades.json

@@ -34,8 +34,9 @@ try:                                  # keep emoji-safe on Windows consoles
 except Exception:
     pass
 
-BASE  = os.path.dirname(os.path.abspath(__file__))
-STATE = os.path.join(BASE, "state.json")
+BASE   = os.path.dirname(os.path.abspath(__file__))
+STATE  = os.path.join(BASE, "state.json")
+TRADES = os.path.join(BASE, "trades.json")
 CONF_THRESHOLD = 80          # only alert at or above this confidence
 RR_MIN         = 2.0         # hard minimum risk:reward to TP2
 
@@ -398,8 +399,115 @@ def gap_scan(symbols=None, dry=False):
         save_json(STATE, state)
     log(f"gap scan complete: {len(rows)} gap(s) reported")
 
+# ── trade tracking (open / monitor TP-SL / portfolio) ──────────────────────
+# Model: 1 unit risking 1R to the original SL, target = TP2 (1:2).
+#   SL hit before TP1  -> LOSS (-1R)
+#   TP1 hit            -> milestone alert, stop moves to breakeven (entry)
+#   TP2 hit            -> WIN (+2R)
+#   stopped at entry after TP1 -> BREAKEVEN (0R)
+def notify(text: str, dry: bool = False) -> bool:
+    if dry:
+        print("\n" + text + "\n")
+        return True
+    return send_telegram(text)
+
+def record_trade(setup: dict) -> None:
+    trades = load_json(TRADES, [])
+    tid = f"{setup['name']}:{setup['direction']}:{setup['tf']}:{setup['sig_time']}"
+    if any(t["id"] == tid for t in trades):
+        return
+    s = setup["sig"]
+    trades.append({
+        "id": tid, "symbol": setup["name"], "ticker": WATCHLIST[setup["name"]][0],
+        "pip": setup["pip"], "tf": setup["tf"], "direction": setup["direction"],
+        "entry": s["entry"], "sl": s["sl"], "tp1": setup["tp1"], "tp2": setup["tp2"],
+        "conf": setup["conf"], "opened_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "sig_time": setup["sig_time"], "last_checked": setup["sig_time"],
+        "status": "open", "stop": s["sl"], "tp1_hit": False,
+    })
+    save_json(TRADES, trades)
+
+def _tp1_msg(t):
+    return (f"🎯 TP1 HIT — {t['symbol']} {t['direction']}\n"
+            f"First target reached (+1R). Stop moved to breakeven ({fmt_price(t['entry'], t['pip'])}).\n"
+            f"Now targeting TP2 {fmt_price(t['tp2'], t['pip'])}.")
+
+def _close_msg(t):
+    r = t["result"]
+    if r == "win":
+        head = f"✅ WIN — {t['symbol']} {t['direction']} hit TP2  (+2R)"
+    elif r == "loss":
+        head = f"🛑 LOSS — {t['symbol']} {t['direction']} hit stop  (-1R)"
+    else:
+        head = f"⚪ BREAKEVEN — {t['symbol']} {t['direction']} stopped at entry after TP1  (0R)"
+    return head + f"\nExit {fmt_price(t['exit_price'], t['pip'])}  ·  opened {t['opened_at'][:16]}Z"
+
+def monitor_trades(dry: bool = False) -> int:
+    trades = load_json(TRADES, [])
+    closes = 0
+    for t in trades:
+        if t["status"] not in ("open", "tp1"):
+            continue
+        df = fetch(t["ticker"], "30m", "7d")
+        if df is None or df.empty:
+            continue
+        try:
+            start = pd.Timestamp(t.get("last_checked") or t["sig_time"])
+        except Exception:
+            start = df.index[0]
+        bars = df[df.index > start]
+        buy = t["direction"] == "BUY"
+        for ts, row in bars.iterrows():
+            hi, lo = float(row["high"]), float(row["low"])
+            stop, tp1, tp2 = t["stop"], t["tp1"], t["tp2"]
+            hit_stop = lo <= stop if buy else hi >= stop
+            hit_tp1  = hi >= tp1 if buy else lo <= tp1
+            hit_tp2  = hi >= tp2 if buy else lo <= tp2
+            if hit_stop:                                   # pessimistic: stop checked first
+                be = abs(stop - t["entry"]) < t["entry"] * 1e-6
+                t.update(status="closed", result="breakeven" if be else "loss",
+                         r_multiple=0.0 if be else -1.0, exit_price=stop, closed_at=str(ts))
+                notify(_close_msg(t), dry); closes += 1
+                break
+            if not t["tp1_hit"] and hit_tp1:
+                t["tp1_hit"] = True; t["status"] = "tp1"; t["stop"] = t["entry"]
+                notify(_tp1_msg(t), dry)
+            if hit_tp2:
+                t.update(status="closed", result="win", r_multiple=2.0,
+                         exit_price=tp2, closed_at=str(ts))
+                notify(_close_msg(t), dry); closes += 1
+                break
+        if bars.shape[0]:
+            t["last_checked"] = str(bars.index[-1])
+    save_json(TRADES, trades)
+    if closes:
+        notify(portfolio_summary(), dry)
+    return closes
+
+def portfolio_summary() -> str:
+    trades = load_json(TRADES, [])
+    closed = [t for t in trades if t["status"] == "closed"]
+    opn = [t for t in trades if t["status"] in ("open", "tp1")]
+    wins = [t for t in closed if t["result"] == "win"]
+    loss = [t for t in closed if t["result"] == "loss"]
+    be = [t for t in closed if t["result"] == "breakeven"]
+    decisive = len(wins) + len(loss)
+    wr = (len(wins) / decisive * 100) if decisive else 0
+    net = sum(t.get("r_multiple", 0) for t in closed)
+    lines = [
+        "📊 FxBreezy PORTFOLIO",
+        f"Closed: {len(closed)}   ✅ {len(wins)}W  🛑 {len(loss)}L  ⚪ {len(be)}BE",
+        f"Win rate: {wr:.0f}%   Net: {net:+.1f}R",
+        f"Open trades: {len(opn)}",
+    ]
+    for t in opn:
+        st = "TP1✓ (BE)" if t["tp1_hit"] else "running"
+        lines.append(f"  • {t['symbol']} {t['direction']} @ {fmt_price(t['entry'], t['pip'])} — {st}")
+    return "\n".join(lines)
+
 # ── main scan ───────────────────────────────────────────────────────────────
 def run_scan(symbols=None, dry=False):
+    monitor_trades(dry)                       # update open trades & fire TP/SL alerts first
     state = load_json(STATE, {})
     targets = symbols or list(WATCHLIST.keys())
     found, sent = 0, 0
@@ -432,6 +540,7 @@ def run_scan(symbols=None, dry=False):
                 state[key] = {"sent_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                               "conf": setup["conf"]}
                 save_json(STATE, state)
+                record_trade(setup)            # log it as an open trade to track TP/SL
                 sent += 1
         time.sleep(0.5)
     log(f"scan complete: {len(targets)} scanned, {found} setups, {sent} alerts sent")
@@ -443,6 +552,8 @@ def main():
     ap.add_argument("--ping", action="store_true", help="send a test message and exit")
     ap.add_argument("--dry", action="store_true", help="analyse + print, never send")
     ap.add_argument("--gap", action="store_true", help="run weekend-gap analysis instead of a scan")
+    ap.add_argument("--monitor", action="store_true", help="only monitor open trades for TP/SL")
+    ap.add_argument("--summary", action="store_true", help="send the portfolio summary and exit")
     ap.add_argument("--symbols", help="comma-separated subset, e.g. EURUSD,XAUUSD")
     args = ap.parse_args()
 
@@ -450,6 +561,10 @@ def main():
         ok = send_telegram("🤖 FxBreezy analyst online — scanner reachable and authorised.")
         log(f"ping sent ok={ok}")
         return
+    if args.summary:
+        notify(portfolio_summary(), args.dry); return
+    if args.monitor:
+        n = monitor_trades(args.dry); log(f"monitor: {n} trade(s) closed"); return
     syms = [s.strip().upper() for s in args.symbols.split(",")] if args.symbols else None
     if args.gap:
         gap_scan(symbols=syms, dry=args.dry)
