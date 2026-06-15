@@ -4,3 +4,5 @@ config.json
 *.log
 __pycache__/
 trades.json
+listener.lock
+tg_offset.txt

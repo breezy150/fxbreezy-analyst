@@ -595,11 +595,19 @@ def stats_dashboard() -> str:
     )
 
 def listen():
-    """Long-poll Telegram and reply to /stats and /summary commands. Runs forever."""
+    """Long-poll Telegram and reply to /stats and /summary. Self-healing singleton."""
     tok, chat = creds()
     if not (tok and chat):
         log("listen: no creds")
         return
+    # singleton guard: if another listener's heartbeat is fresh (<120s), don't double-poll
+    lock = os.path.join(BASE, "listener.lock")
+    try:
+        if os.path.exists(lock) and (time.time() - os.path.getmtime(lock)) < 120:
+            log("listener already running (fresh lock) — exiting duplicate")
+            return
+    except Exception:
+        pass
     base = f"https://api.telegram.org/bot{tok}"
     off_file = os.path.join(BASE, "tg_offset.txt")
     try:
@@ -609,6 +617,10 @@ def listen():
     log("listener started — commands: /stats /summary /help")
     while True:
         try:
+            try:
+                open(lock, "w").write(str(time.time()))      # heartbeat
+            except Exception:
+                pass
             url = f"{base}/getUpdates?timeout=50" + (f"&offset={offset}" if offset else "")
             with urllib.request.urlopen(url, timeout=70) as r:
                 data = json.loads(r.read().decode())
