@@ -1,0 +1,39 @@
+name: FxBreezy Market Scan
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"      # every 30 minutes (UTC); GitHub may delay under load
+  workflow_dispatch: {}          # lets you run it manually from the Actions tab
+
+concurrency:                     # never let two scans overlap
+  group: fxbreezy-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write            # to commit the dedupe state back
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install -r fxbreezy_bot/requirements.txt
+
+      - name: Run scan
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python fxbreezy_bot/scanner.py
+
+      - name: Persist dedupe state
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add fxbreezy_bot/state.json || true
+          git commit -m "scan state [skip ci]" || echo "no state change"
+          git push || echo "nothing to push"
