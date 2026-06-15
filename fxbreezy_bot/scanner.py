@@ -326,6 +326,78 @@ def analyse(name: str, ticker: str, pip: float):
                     bias_txt=bias_txt, invalidation=invalid, sig_time=sig_time)
     return None
 
+# ── weekend gap analysis ────────────────────────────────────────────────────
+def weekend_gap(h1: pd.DataFrame):
+    """Find the weekend break (largest inter-bar time gap) and measure it."""
+    idx = h1.index
+    if len(idx) < 3:
+        return None
+    diffs = idx.to_series().diff()
+    pos = int(np.nanargmax(diffs.values[1:])) + 1     # position of the biggest gap
+    if diffs.iloc[pos].total_seconds() / 3600 < 12:   # not a weekend-sized break
+        return None
+    cb = float(h1["close"].iloc[pos - 1])
+    oa = float(h1["open"].iloc[pos])
+    if cb == 0:
+        return None
+    return dict(close_before=cb, open_after=oa, gap=oa - cb,
+                pct=(oa - cb) / cb * 100, when=idx[pos])
+
+def build_gap_report(rows) -> str:
+    lines = ["🗓 WEEKEND GAP REPORT", f"{len(rows)} instrument(s) gapped at the open:\n"]
+    for name, g, bias, pip in rows:
+        up = g["gap"] > 0
+        arrow = "🔼 GAP UP" if up else "🔽 GAP DOWN"
+        if (bias == "bull" and up) or (bias == "bear" and not up):
+            ctx = "supports the D1 trend → watch for continuation confirmation"
+        elif bias in ("bull", "bear"):
+            ctx = "counter-trend gap → statistically likely to fill"
+        else:
+            ctx = "no clear D1 trend → treat as range, expect a fill"
+        lines.append(f"{arrow}  {name}  {g['pct']:+.2f}%")
+        lines.append(f"   {fmt_price(g['close_before'], pip)} → {fmt_price(g['open_after'], pip)}  ·  D1 {bias.upper()}")
+        lines.append(f"   {ctx}")
+    lines.append("\n⚠️ Don't trade the gap blind — wait for confirmation before entering.")
+    return "\n".join(lines)
+
+def gap_scan(symbols=None, dry=False):
+    state = load_json(STATE, {})
+    targets = symbols or [n for n in WATCHLIST if n != "BTCUSD"]   # crypto trades 24/7
+    rows, newest = [], None
+    for name in targets:
+        if name not in WATCHLIST:
+            continue
+        ticker, pip = WATCHLIST[name]
+        h1 = fetch(ticker, "60m", "7d")
+        if h1 is None or len(h1) < 10:
+            continue
+        g = weekend_gap(h1)
+        if not g:
+            continue
+        age_h = (pd.Timestamp.now(tz="UTC") - g["when"]).total_seconds() / 3600
+        if age_h > 36 or abs(g["pct"]) < 0.15:        # only fresh + meaningful gaps
+            continue
+        d1 = fetch(ticker, "1d", "2y")
+        bias = trend_bias(d1) if d1 is not None and len(d1) > 60 else "none"
+        rows.append((name, g, bias, pip))
+        newest = g["when"] if newest is None or g["when"] > newest else newest
+        time.sleep(0.3)
+    if not rows:
+        log("gap scan: no significant weekend gaps")
+        return
+    rows.sort(key=lambda r: abs(r[1]["pct"]), reverse=True)
+    key = f"gapreport:{str(newest)[:10]}"
+    if state.get(key) and not dry:
+        log("gap report already sent this weekend")
+        return
+    msg = build_gap_report(rows)
+    if dry:
+        print("\n" + msg + "\n")
+    elif send_telegram(msg):
+        state[key] = {"sent_at": dt.datetime.now(dt.timezone.utc).isoformat(), "count": len(rows)}
+        save_json(STATE, state)
+    log(f"gap scan complete: {len(rows)} gap(s) reported")
+
 # ── main scan ───────────────────────────────────────────────────────────────
 def run_scan(symbols=None, dry=False):
     state = load_json(STATE, {})
@@ -370,6 +442,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ping", action="store_true", help="send a test message and exit")
     ap.add_argument("--dry", action="store_true", help="analyse + print, never send")
+    ap.add_argument("--gap", action="store_true", help="run weekend-gap analysis instead of a scan")
     ap.add_argument("--symbols", help="comma-separated subset, e.g. EURUSD,XAUUSD")
     args = ap.parse_args()
 
@@ -378,7 +451,10 @@ def main():
         log(f"ping sent ok={ok}")
         return
     syms = [s.strip().upper() for s in args.symbols.split(",")] if args.symbols else None
-    run_scan(symbols=syms, dry=args.dry)
+    if args.gap:
+        gap_scan(symbols=syms, dry=args.dry)
+    else:
+        run_scan(symbols=syms, dry=args.dry)
 
 if __name__ == "__main__":
     main()
