@@ -148,15 +148,39 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
     return tr.ewm(span=n, adjust=False).mean()
 
+def swings(df: pd.DataFrame, k: int = 5):
+    """Return (swing_highs, swing_lows) as lists of (positional_index, price)."""
+    h = df["high"].values; l = df["low"].values
+    ph, pl = [], []
+    for i in range(k, len(df) - k):
+        if h[i] == max(h[i - k:i + k + 1]):
+            ph.append((i, float(h[i])))
+        if l[i] == min(l[i - k:i + k + 1]):
+            pl.append((i, float(l[i])))
+    return ph, pl
+
+def structure_bias(df: pd.DataFrame, k: int = 5) -> str:
+    """bull = HH+HL, bear = LH+LL, else none (last two swings each side)."""
+    ph, pl = swings(df, k)
+    if len(ph) < 2 or len(pl) < 2:
+        return "none"
+    if ph[-1][1] > ph[-2][1] and pl[-1][1] > pl[-2][1]:
+        return "bull"
+    if ph[-1][1] < ph[-2][1] and pl[-1][1] < pl[-2][1]:
+        return "bear"
+    return "none"
+
 def trend_bias(df: pd.DataFrame) -> str:
-    """bull / bear / none from EMA structure + slope + price location."""
+    """Daily/4H bias = market structure (HH/HL vs LH/LL) confirmed by EMA50/200."""
+    sb = structure_bias(df, 5)
     c = df["close"]
     slow_n = min(200, max(50, len(c) // 2))
-    ef, es = ema(c, 50), ema(c, slow_n)
-    last = c.iloc[-1]
-    up = ef.iloc[-1] > es.iloc[-1] and last > ef.iloc[-1] and ef.iloc[-1] > ef.iloc[-4]
-    dn = ef.iloc[-1] < es.iloc[-1] and last < ef.iloc[-1] and ef.iloc[-1] < ef.iloc[-4]
-    return "bull" if up else "bear" if dn else "none"
+    ema_up = ema(c, 50).iloc[-1] > ema(c, slow_n).iloc[-1]
+    if sb == "bull" and ema_up:
+        return "bull"
+    if sb == "bear" and not ema_up:
+        return "bear"
+    return "none"
 
 def clean_structure(df: pd.DataFrame, direction: str, k: int = 3, look: int = 40) -> bool:
     """Confirm HH/HL (bull) or LH/LL (bear) from recent pivots."""
@@ -177,57 +201,68 @@ def clean_structure(df: pd.DataFrame, direction: str, k: int = 3, look: int = 40
 # ── candle / entry logic on the trigger timeframe ───────────────────────────
 def candle_signal(df: pd.DataFrame, direction: str):
     """
-    Inspect the last CLOSED candle for a trend-continuation entry.
-    Returns dict(entry, sl, kind, pullback, momentum, deep) or None.
+    Break-and-retest entry on the trigger TF: find a key level (swing high/low)
+    that price BROKE, then RETESTED, with a CONFIRMATION candle on the last
+    closed bar. Returns dict(entry, sl, tp, level, kind, engulf) or None.
     """
-    c = df["close"]
-    e20, e50 = ema(c, 20), ema(c, 50)
-    a = atr(df, 14)
-    if len(df) < 55 or pd.isna(a.iloc[-2]):
+    if len(df) < 60:
         return None
-
-    # use the last fully-closed candle (-2); -1 may still be forming
-    o, h, l, cl = (df["open"].iloc[-2], df["high"].iloc[-2],
-                   df["low"].iloc[-2], df["close"].iloc[-2])
-    po, pc = df["open"].iloc[-3], df["close"].iloc[-3]
-    prng = df["high"].iloc[-3] - df["low"].iloc[-3]
-    body = abs(cl - o)
-    uw, lw = h - max(cl, o), min(cl, o) - l
-    av = a.iloc[-2]
-    ema20, ema50 = e20.iloc[-2], e50.iloc[-2]
-
-    # pullback: the recent swing tagged the value zone (ema20..ema50) within ~0.6 ATR
-    recent_low = df["low"].iloc[-6:-1].min()
-    recent_high = df["high"].iloc[-6:-1].max()
+    a = atr(df, 14)
+    o = df["open"].values; h = df["high"].values
+    l = df["low"].values; c = df["close"].values
+    idx = len(df) - 2                       # last fully-closed bar = confirmation candle
+    av = float(a.iloc[idx])
+    if not np.isfinite(av) or av <= 0:
+        return None
+    tol = 0.30 * av
+    ph, pl = swings(df, 4)
+    body = abs(c[idx] - o[idx])
 
     if direction == "BUY":
-        engulf = cl > o and pc < po and body > prng * 0.8 and cl > df["high"].iloc[-3]
-        pin = body > 0 and lw >= body * 2.0 and uw <= body * 0.4
-        if not (engulf or pin):
+        recent_low = float(np.min(l[idx - 3:idx + 1]))               # the retest dip
+        # broken resistances the recent low is now retesting (flipped to support)
+        cands = [p for (i, p) in ph
+                 if i <= idx - 1 and p < c[idx] and abs(recent_low - p) <= tol
+                 and any(c[j] > p for j in range(i + 1, idx + 1))]
+        if not cands:
             return None
-        pullback = recent_low <= ema20 + 0.6 * av and cl > ema50      # dipped to value, trend intact
-        deep = recent_low <= ema50 + 0.3 * av
-        momentum = cl > ema20
-        if not (pullback and momentum):
+        level = max(cands)
+        engulf = c[idx] > o[idx] and c[idx - 1] < o[idx - 1] and c[idx] > h[idx - 1]
+        pin = (min(c[idx], o[idx]) - l[idx]) >= body * 1.5 and c[idx] > o[idx]
+        momentum = c[idx] > o[idx] and body > av * 0.5
+        if not (c[idx] > level and (engulf or pin or momentum)):
             return None
-        entry = cl
-        sl = min(recent_low, l) - 0.15 * av
-        return dict(entry=entry, sl=sl, kind="Engulfing" if engulf else "Pin Bar",
-                    pullback=True, deep=deep, momentum=momentum)
+        entry = c[idx]
+        sl = min(recent_low, level) - 0.10 * av
+        risk = entry - sl
+        above = [p for (i, p) in ph if p > entry + tol]
+        tp = min(above) if above else entry + risk * 2
+        if tp - entry < risk * 2:
+            tp = entry + risk * 2
+        kind = "Engulfing" if engulf else ("Rejection" if pin else "Momentum")
+        return dict(entry=entry, sl=sl, tp=tp, level=level, kind=kind, engulf=bool(engulf))
     else:
-        engulf = cl < o and pc > po and body > prng * 0.8 and cl < df["low"].iloc[-3]
-        pin = body > 0 and uw >= body * 2.0 and lw <= body * 0.4
-        if not (engulf or pin):
+        recent_high = float(np.max(h[idx - 3:idx + 1]))              # the retest pop
+        cands = [p for (i, p) in pl
+                 if i <= idx - 1 and p > c[idx] and abs(recent_high - p) <= tol
+                 and any(c[j] < p for j in range(i + 1, idx + 1))]
+        if not cands:
             return None
-        pullback = recent_high >= ema20 - 0.6 * av and cl < ema50
-        deep = recent_high >= ema50 - 0.3 * av
-        momentum = cl < ema20
-        if not (pullback and momentum):
+        level = min(cands)
+        engulf = c[idx] < o[idx] and c[idx - 1] > o[idx - 1] and c[idx] < l[idx - 1]
+        pin = (h[idx] - max(c[idx], o[idx])) >= body * 1.5 and c[idx] < o[idx]
+        momentum = c[idx] < o[idx] and body > av * 0.5
+        if not (c[idx] < level and (engulf or pin or momentum)):
             return None
-        entry = cl
-        sl = max(recent_high, h) + 0.15 * av
-        return dict(entry=entry, sl=sl, kind="Engulfing" if engulf else "Pin Bar",
-                    pullback=True, deep=deep, momentum=momentum)
+        entry = c[idx]
+        sl = max(recent_high, level) + 0.10 * av
+        risk = sl - entry
+        below = [p for (i, p) in pl if p < entry - tol]
+        tp = max(below) if below else entry - risk * 2
+        if entry - tp < risk * 2:
+            tp = entry - risk * 2
+        kind = "Engulfing" if engulf else ("Rejection" if pin else "Momentum")
+        return dict(entry=entry, sl=sl, tp=tp, level=level, kind=kind, engulf=bool(engulf))
 
 # ── session helper ──────────────────────────────────────────────────────────
 def session_label() -> str | None:
@@ -290,18 +325,18 @@ def build_alert(name, tf, direction, sig, tp1, tp2, rr2, conf, pip, bias_txt,
     side = "🟢 BUY" if direction == "BUY" else "🔴 SELL"
     return (
         f"⚡ FxBreezy SIGNAL | {sym_disp(name)}\n\n"
-        f"{side}\n"
+        f"{side}  ·  Setup {conf}\n"
         f"{'━' * 12}\n"
+        f"🔑 Key Level: {p(sig['level'])}\n"
         f"Entry: {p(sig['entry'])}\n"
         f"SL: {p(sig['sl'])} (-1R)\n"
         f"TP1: {p(tp1)} (+1R)\n"
-        f"TP2: {p(tp2)} (+2R)\n\n"
-        f"🎯 Setup Score: {conf}%  (rule-based)\n"
+        f"TP2: {p(tp2)} (+{rr2:.1f}R)\n\n"
         f"📊 Status: ACTIVE\n"
         f"Progress: {pbar(0, 8)} 0%\n"
         f"Current: +0.0R\n"
         f"🛡 Protection: SL → BE\n"
-        f"⏱ Scan: {tf}\n"
+        f"⏱ Scan: {tf} · break & retest\n"
         f"🕒 Open: {dt.datetime.now(dt.timezone.utc):%d %b %H:%M}\n"
         f"#FxBreezy"
     )
@@ -317,40 +352,31 @@ def analyse(name: str, ticker: str, pip: float):
         return None
     direction = "BUY" if bias_d == "bull" else "SELL"
 
-    for tf_name, df in (("30M", m30), ("1H", h1)):
+    for tf_name, df in (("1H", h1), ("30M", m30)):       # 1H primary, 30M secondary
         sig = candle_signal(df, direction)
         if not sig:
             continue
         # freshness: only act on a just-closed candle (also skips stale/weekend data)
-        bar_min = 30 if tf_name == "30M" else 60
+        bar_min = 60 if tf_name == "1H" else 30
         age_min = (pd.Timestamp.now(tz="UTC") - df.index[-2]).total_seconds() / 60
         if age_min > bar_min * 2.5:
             continue
-        risk = abs(sig["entry"] - sig["sl"])
+        entry, sl = sig["entry"], sig["sl"]
+        risk = abs(entry - sl)
         if risk <= 0:
             continue
-        if direction == "BUY":
-            tp1 = sig["entry"] + risk * 1.0
-            tp2 = sig["entry"] + risk * 2.0
-        else:
-            tp1 = sig["entry"] - risk * 1.0
-            tp2 = sig["entry"] - risk * 2.0
-        rr2 = abs(tp2 - sig["entry"]) / risk
+        tp1 = entry + risk if direction == "BUY" else entry - risk
+        tp2 = sig["tp"]                                   # next major level (>= 2R enforced)
+        rr2 = abs(tp2 - entry) / risk
         if rr2 < RR_MIN:
             continue
-        struct_ok = clean_structure(df, direction)
-        in_sess = session_label() is not None
-        conf = score_setup(sig, struct_ok, rr2, in_sess)
-        if conf < CONF_THRESHOLD:
-            continue
-        bias_txt = (f"D1 {bias_d.upper()} + H4 {bias_h4.upper()} aligned"
-                    f"{' · clean structure' if struct_ok else ''}")
-        invalid = ("Close beyond stop / loss of " +
-                   ("HL" if direction == "BUY" else "LH") + " structure")
-        sig_time = str(df.index[-2])
+        grade = "A+" if (sig["engulf"] and rr2 >= 3) else "B"
+        bias_txt = f"D1 {bias_d.upper()} + H4 {bias_h4.upper()} (HH/HL)"
+        invalid = (f"Close back below {fmt_price(sig['level'], pip)}" if direction == "BUY"
+                   else f"Close back above {fmt_price(sig['level'], pip)}")
         return dict(name=name, tf=tf_name, direction=direction, sig=sig,
-                    tp1=tp1, tp2=tp2, rr2=rr2, conf=conf, pip=pip,
-                    bias_txt=bias_txt, invalidation=invalid, sig_time=sig_time)
+                    tp1=tp1, tp2=tp2, rr2=rr2, conf=grade, pip=pip,
+                    bias_txt=bias_txt, invalidation=invalid, sig_time=str(df.index[-2]))
     return None
 
 # ── weekend gap analysis ────────────────────────────────────────────────────
