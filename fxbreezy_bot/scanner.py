@@ -296,6 +296,7 @@ def build_alert(name, tf, direction, sig, tp1, tp2, rr2, conf, pip, bias_txt,
         f"SL: {p(sig['sl'])} (-1R)\n"
         f"TP1: {p(tp1)} (+1R)\n"
         f"TP2: {p(tp2)} (+2R)\n\n"
+        f"🎯 Setup Score: {conf}%  (rule-based)\n"
         f"📊 Status: ACTIVE\n"
         f"Progress: {pbar(0, 8)} 0%\n"
         f"Current: +0.0R\n"
@@ -672,7 +673,7 @@ def run_scan(symbols=None, dry=False):
         msg = build_alert(setup["name"], setup["tf"], setup["direction"], setup["sig"],
                           setup["tp1"], setup["tp2"], setup["rr2"], setup["conf"],
                           setup["pip"], setup["bias_txt"], setup["invalidation"])
-        log(f"{name}: SIGNAL {setup['direction']} {setup['tf']} conf={setup['conf']}%")
+        log(f"{name}: SIGNAL {setup['direction']} {setup['tf']} score={setup['conf']}%")
         if dry:
             print("\n" + msg + "\n")
         else:
