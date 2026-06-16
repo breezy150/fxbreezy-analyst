@@ -318,6 +318,7 @@ def build_alert(name, tf, direction, sig, tp1, tp2, rr2, conf, pip, bias_txt,
     sess = f"{sl} Session Open" if sl else "Outside main sessions"
     return (
         f"{head} — {name}\n"
+        f"────────────\n"
         f"📍 Entry: {p(sig['entry'])}\n"
         f"🛑 Stop Loss: {p(sig['sl'])}\n"
         f"🎯 TP1: {p(tp1)}\n"
