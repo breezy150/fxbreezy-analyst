@@ -7,3 +7,4 @@ trades.json
 listener.lock
 tg_offset.txt
 bias_state.json
+price_alerts.json

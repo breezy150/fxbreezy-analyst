@@ -38,6 +38,7 @@ BASE   = os.path.dirname(os.path.abspath(__file__))
 STATE  = os.path.join(BASE, "state.json")
 TRADES = os.path.join(BASE, "trades.json")
 BIASES = os.path.join(BASE, "bias_state.json")
+ALERTS = os.path.join(BASE, "price_alerts.json")
 CONF_THRESHOLD = 80          # only alert at or above this confidence
 RR_MIN         = 2.0         # hard minimum risk:reward to TP2
 
@@ -694,10 +695,18 @@ def trend_change_msg(name, prev, new) -> str:
         f"#FxBreezy"
     )
 
+def price_alert_msg(name, level, direction, note, pip) -> str:
+    d = "ABOVE" if direction == "above" else "BELOW"
+    body = f"🔔 PRICE ALERT | {sym_disp(name)}\n\nPrice crossed {d} {fmt_price(level, pip)}"
+    if note:
+        body += f"\n{note}"
+    return body + "\n\n#FxBreezy"
+
 def run_scan(symbols=None, dry=False):
     monitor_trades(dry)                       # update open trades & fire TP/SL alerts first
     state = load_json(STATE, {})
     biases = load_json(BIASES, {})
+    palerts = load_json(ALERTS, {})
     targets = symbols or list(WATCHLIST.keys())
     found, sent, flips = 0, 0, 0
     for name in targets:
@@ -725,6 +734,24 @@ def run_scan(symbols=None, dry=False):
                     send_telegram(msg)
             biases[name] = ob
             save_json(BIASES, biases)
+
+        # ── price-level alerts (key levels to watch) ──
+        watch = palerts.get(name)
+        if watch:
+            price = float(h1["close"].iloc[-1])
+            keep = []
+            for al in watch:
+                hit = ((al["dir"] == "above" and price >= al["level"]) or
+                       (al["dir"] == "below" and price <= al["level"]))
+                if hit:
+                    log(f"{name}: PRICE ALERT {al['dir']} {al['level']}")
+                    m = price_alert_msg(name, al["level"], al["dir"], al.get("note", ""), pip)
+                    print("\n" + m + "\n") if dry else send_telegram(m)
+                else:
+                    keep.append(al)
+            if len(keep) != len(watch):
+                palerts[name] = keep
+                save_json(ALERTS, palerts)
 
         # ── break-and-retest setup ──
         try:
