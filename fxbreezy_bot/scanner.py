@@ -311,23 +311,21 @@ def fmt_dur(a, b) -> str:
 def build_alert(name, tf, direction, sig, tp1, tp2, rr2, conf, pip, bias_txt,
                 invalidation) -> str:
     p = lambda v: fmt_price(v, pip)
-    side = "🟢 BUY" if direction == "BUY" else "🔴 SELL"
+    head = "📈 BUY SIGNAL" if direction == "BUY" else "📉 SELL SIGNAL"
+    pa = "Bullish PA" if direction == "BUY" else "Bearish PA"
+    score_arrow = "⬆️" if direction == "BUY" else "⬇️"
+    sl = session_label()
+    sess = f"{sl} Session Open" if sl else "Outside main sessions"
     return (
-        f"⚡ FxBreezy SIGNAL | {sym_disp(name)}\n\n"
-        f"{side}\n"
-        f"{'━' * 12}\n"
-        f"Entry: {p(sig['entry'])}\n"
-        f"SL: {p(sig['sl'])} (-1R)\n"
-        f"TP1: {p(tp1)} (+1R)\n"
-        f"TP2: {p(tp2)} (+2R)\n\n"
-        f"🎯 Setup Score: {conf}%  (rule-based)\n"
-        f"📊 Status: ACTIVE\n"
-        f"Progress: {pbar(0, 8)} 0%\n"
-        f"Current: +0.0R\n"
-        f"🛡 Protection: SL → BE\n"
-        f"⏱ Scan: {tf}\n"
-        f"🕒 Open: {dt.datetime.now(dt.timezone.utc):%d %b %H:%M}\n"
-        f"#FxBreezy"
+        f"{head} — {name}\n"
+        f"📍 Entry: {p(sig['entry'])}\n"
+        f"🛑 Stop Loss: {p(sig['sl'])}\n"
+        f"🎯 TP1: {p(tp1)}\n"
+        f"🎯 TP2: {p(tp2)}\n"
+        f"📊 R:R — 1:{rr2:g}\n"
+        f"⏰ {sess}\n"
+        f"✅ Confirmed — High Volume + {pa}\n"
+        f"{score_arrow} Setup Score: {conf}%  (rule-based)"
     )
 
 # ── per-symbol analysis ─────────────────────────────────────────────────────
