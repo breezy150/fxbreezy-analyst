@@ -37,6 +37,7 @@ except Exception:
 BASE   = os.path.dirname(os.path.abspath(__file__))
 STATE  = os.path.join(BASE, "state.json")
 TRADES = os.path.join(BASE, "trades.json")
+BIASES = os.path.join(BASE, "bias_state.json")
 CONF_THRESHOLD = 80          # only alert at or above this confidence
 RR_MIN         = 2.0         # hard minimum risk:reward to TP2
 
@@ -342,10 +343,7 @@ def build_alert(name, tf, direction, sig, tp1, tp2, rr2, conf, pip, bias_txt,
     )
 
 # ── per-symbol analysis ─────────────────────────────────────────────────────
-def analyse(name: str, ticker: str, pip: float):
-    frames = get_frames(ticker)
-    if not frames:
-        return None
+def analyse_frames(name: str, frames, pip: float):
     d1, h4, h1, m30 = frames
     bias_d, bias_h4 = trend_bias(d1), trend_bias(h4)
     if bias_d == "none" or bias_d != bias_h4:        # HTF must agree
@@ -673,18 +671,64 @@ def listen():
             time.sleep(5)
 
 # ── main scan ───────────────────────────────────────────────────────────────
+def overall_bias(d1, h4) -> str:
+    """Combined HTF bias: bull/bear only when Daily and 4H agree, else none."""
+    bd, bh = trend_bias(d1), trend_bias(h4)
+    return bd if (bd == bh and bd != "none") else "none"
+
+def trend_change_msg(name, prev, new) -> str:
+    if new == "bear":
+        arrow = "🔻 BULLISH → BEARISH"
+        ev = "Daily + 4H structure flipped to LH + LL; momentum bearish"
+        plan = "Stop hunting BUYs. Wait for a bearish break-&-retest."
+    else:
+        arrow = "🔺 BEARISH → BULLISH"
+        ev = "Daily + 4H structure flipped to HH + HL; momentum bullish"
+        plan = "Stop hunting SELLs. Wait for a bullish break-&-retest."
+    return (
+        f"⚠️ TREND CHANGE | {sym_disp(name)}\n\n"
+        f"{arrow}\n"
+        f"{'━' * 12}\n"
+        f"Evidence:\n{ev}\n\n"
+        f"New Plan:\n{plan}\n\n"
+        f"#FxBreezy"
+    )
+
 def run_scan(symbols=None, dry=False):
     monitor_trades(dry)                       # update open trades & fire TP/SL alerts first
     state = load_json(STATE, {})
+    biases = load_json(BIASES, {})
     targets = symbols or list(WATCHLIST.keys())
-    found, sent = 0, 0
+    found, sent, flips = 0, 0, 0
     for name in targets:
         if name not in WATCHLIST:
             log(f"skip unknown symbol {name}")
             continue
         ticker, pip = WATCHLIST[name]
+        frames = get_frames(ticker)
+        if not frames:
+            log(f"{name}: data unavailable")
+            continue
+        d1, h4, h1, m30 = frames
+
+        # ── trend-change detection: alert when the agreed Daily+4H bias flips ──
+        ob = overall_bias(d1, h4)
+        if ob != "none":
+            prev = biases.get(name)
+            if prev in ("bull", "bear") and prev != ob:
+                log(f"{name}: TREND CHANGE {prev}->{ob}")
+                flips += 1
+                msg = trend_change_msg(name, prev, ob)
+                if dry:
+                    print("\n" + msg + "\n")
+                else:
+                    send_telegram(msg)
+            biases[name] = ob
+            save_json(BIASES, biases)
+
+        # ── break-and-retest setup ──
         try:
-            setup = analyse(name, ticker, pip)
+            setup = analyse_frames(name, frames, pip)
         except Exception as e:
             log(f"analyse error {name}: {e}")
             continue
@@ -694,23 +738,23 @@ def run_scan(symbols=None, dry=False):
         found += 1
         key = f"{setup['name']}:{setup['direction']}:{setup['tf']}:{setup['sig_time']}"
         if state.get(key):
-            log(f"{name}: setup already alerted ({key})")
+            log(f"{name}: setup already alerted")
             continue
         msg = build_alert(setup["name"], setup["tf"], setup["direction"], setup["sig"],
                           setup["tp1"], setup["tp2"], setup["rr2"], setup["conf"],
                           setup["pip"], setup["bias_txt"], setup["invalidation"])
-        log(f"{name}: SIGNAL {setup['direction']} {setup['tf']} score={setup['conf']}%")
+        log(f"{name}: SIGNAL {setup['direction']} {setup['tf']} grade={setup['conf']}")
         if dry:
             print("\n" + msg + "\n")
         else:
             if send_telegram(msg):
                 state[key] = {"sent_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                              "conf": setup["conf"]}
+                              "grade": setup["conf"]}
                 save_json(STATE, state)
                 record_trade(setup)            # log it as an open trade to track TP/SL
                 sent += 1
-        time.sleep(0.5)
-    log(f"scan complete: {len(targets)} scanned, {found} setups, {sent} alerts sent")
+        time.sleep(0.4)
+    log(f"scan complete: {len(targets)} scanned, {found} setups, {sent} alerts, {flips} trend-changes")
     return found, sent
 
 # ── entry point ─────────────────────────────────────────────────────────────
