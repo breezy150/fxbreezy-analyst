@@ -316,9 +316,10 @@ def build_alert(name, tf, direction, sig, tp1, tp2, rr2, conf, pip, bias_txt,
     score_arrow = "⬆️" if direction == "BUY" else "⬇️"
     sl = session_label()
     sess = f"{sl} Session Open" if sl else "Outside main sessions"
+    header = f"{head} — {name}"
     return (
-        f"{head} — {name}\n"
-        f"────────────\n"
+        f"{header}\n"
+        f"{'─' * (len(header) + 1)}\n"
         f"📍 Entry: {p(sig['entry'])}\n"
         f"🛑 Stop Loss: {p(sig['sl'])}\n"
         f"🎯 TP1: {p(tp1)}\n"
