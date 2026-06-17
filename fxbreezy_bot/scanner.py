@@ -41,6 +41,8 @@ BIASES = os.path.join(BASE, "bias_state.json")
 ALERTS = os.path.join(BASE, "price_alerts.json")
 CONF_THRESHOLD = 80          # only alert at or above this confidence
 RR_MIN         = 2.0         # hard minimum risk:reward to TP2
+COOLDOWNS      = os.path.join(BASE, "cooldowns.json")
+COOLDOWN_HOURS = 8           # min hours between signals on the SAME pair (anti over-firing)
 
 # ── WATCHLIST ──────────────────────────────────────────────────────────────
 # display name -> (yahoo ticker, pip size). Pip size only affects the "pips"
@@ -338,7 +340,7 @@ def analyse_frames(name: str, frames, pip: float):
         return None
     direction = "BUY" if bias_d == "bull" else "SELL"
 
-    for tf_name, df in (("30M", m30), ("1H", h1)):
+    for tf_name, df in (("1H", h1),):     # 1H only — 30M dropped (too noisy per trade-log analysis)
         sig = candle_signal(df, direction)
         if not sig:
             continue
@@ -703,6 +705,7 @@ def run_scan(symbols=None, dry=False):
     state = load_json(STATE, {})
     biases = load_json(BIASES, {})
     palerts = load_json(ALERTS, {})
+    cooldowns = load_json(COOLDOWNS, {})
     targets = symbols or list(WATCHLIST.keys())
     found, sent, flips = 0, 0, 0
     for name in targets:
@@ -763,6 +766,13 @@ def run_scan(symbols=None, dry=False):
         if state.get(key):
             log(f"{name}: setup already alerted")
             continue
+        # per-symbol cooldown: don't re-fire the same pair within COOLDOWN_HOURS
+        last = cooldowns.get(name)
+        if last:
+            hrs = (pd.Timestamp.now(tz="UTC") - pd.Timestamp(last)).total_seconds() / 3600
+            if hrs < COOLDOWN_HOURS:
+                log(f"{name}: cooldown active ({hrs:.1f}h < {COOLDOWN_HOURS}h) — skip")
+                continue
         msg = build_alert(setup["name"], setup["tf"], setup["direction"], setup["sig"],
                           setup["tp1"], setup["tp2"], setup["rr2"], setup["conf"],
                           setup["pip"], setup["bias_txt"], setup["invalidation"])
@@ -774,6 +784,8 @@ def run_scan(symbols=None, dry=False):
                 state[key] = {"sent_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                               "score": setup["conf"]}
                 save_json(STATE, state)
+                cooldowns[name] = dt.datetime.now(dt.timezone.utc).isoformat()
+                save_json(COOLDOWNS, cooldowns)
                 record_trade(setup)            # log it as an open trade to track TP/SL
                 sent += 1
         time.sleep(0.4)
