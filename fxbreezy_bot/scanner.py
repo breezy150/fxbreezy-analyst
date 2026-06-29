@@ -42,17 +42,15 @@ ALERTS = os.path.join(BASE, "price_alerts.json")
 CONF_THRESHOLD = 80          # only alert at or above this confidence
 RR_MIN         = 2.0         # hard minimum risk:reward to TP2
 COOLDOWNS      = os.path.join(BASE, "cooldowns.json")
-COOLDOWN_HOURS = 8           # min hours between signals on the SAME pair (anti over-firing)
+COOLDOWN_HOURS = 16          # min hours between signals on the SAME pair (anti over-firing)
+MAX_SIGNALS_PER_DAY = 5      # hard daily cap — signals fire freely until this is reached
 
 # ── WATCHLIST ──────────────────────────────────────────────────────────────
 # display name -> (yahoo ticker, pip size). Pip size only affects the "pips"
 # shown in logs; prices are formatted to the instrument's natural precision.
 WATCHLIST = {
     "BTCUSD":  ("BTC-USD",  1.0),
-    "EURUSD":  ("EURUSD=X", 0.0001),
-    "GBPCAD":  ("GBPCAD=X", 0.0001),
     "USDJPY":  ("USDJPY=X", 0.01),
-    "AUDCAD":  ("AUDCAD=X", 0.0001),
     "EURAUD":  ("EURAUD=X", 0.0001),
     "NZDJPY":  ("NZDJPY=X", 0.01),
     "GBPAUD":  ("GBPAUD=X", 0.0001),
@@ -69,6 +67,7 @@ WATCHLIST = {
     "AUDJPY":  ("AUDJPY=X", 0.01),
     "EURJPY":  ("EURJPY=X", 0.01),
 }
+# Removed: EURUSD (0W 2L 1BE, -2R), GBPCAD (0W 4L, -4R), AUDCAD (0W 5L 1BE, -5R)
 
 # ── small utils ─────────────────────────────────────────────────────────────
 def log(msg: str) -> None:
@@ -110,23 +109,28 @@ def send_telegram(text: str) -> bool:
 
 # ── data layer (Yahoo Finance chart API — free, no key) ─────────────────────
 def fetch(ticker: str, interval: str, rng: str) -> pd.DataFrame | None:
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(ticker)}"
-    url += f"?interval={interval}&range={rng}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=25) as r:
-            j = json.loads(r.read().decode())
-        res = j["chart"]["result"][0]
-        ts = res["timestamp"]
-        q = res["indicators"]["quote"][0]
-        df = pd.DataFrame(
-            {"open": q["open"], "high": q["high"], "low": q["low"], "close": q["close"]},
-            index=pd.to_datetime(ts, unit="s", utc=True),
-        ).dropna()
-        return df if len(df) else None
-    except Exception as e:
-        log(f"fetch error {ticker} {interval}/{rng}: {e}")
-        return None
+    hosts = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]
+    for attempt, host in enumerate(hosts):
+        url = (f"https://{host}/v8/finance/chart/{urllib.parse.quote(ticker)}"
+               f"?interval={interval}&range={rng}")
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=25) as r:
+                j = json.loads(r.read().decode())
+            res = j["chart"]["result"][0]
+            ts = res["timestamp"]
+            q = res["indicators"]["quote"][0]
+            df = pd.DataFrame(
+                {"open": q["open"], "high": q["high"], "low": q["low"], "close": q["close"]},
+                index=pd.to_datetime(ts, unit="s", utc=True),
+            ).dropna()
+            return df if len(df) else None
+        except Exception as e:
+            if attempt == 0:
+                log(f"fetch retry {ticker} via query2 ({e})")
+            else:
+                log(f"fetch error {ticker} {interval}/{rng}: {e}")
+    return None
 
 def to_h4(df1h: pd.DataFrame) -> pd.DataFrame:
     agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
@@ -135,13 +139,12 @@ def to_h4(df1h: pd.DataFrame) -> pd.DataFrame:
 def get_frames(ticker: str):
     d1 = fetch(ticker, "1d", "2y")
     h1 = fetch(ticker, "60m", "60d")
-    m30 = fetch(ticker, "30m", "45d")
-    if d1 is None or h1 is None or m30 is None:
+    if d1 is None or h1 is None:
         return None
     h4 = to_h4(h1)
-    if len(d1) < 60 or len(h4) < 60 or len(h1) < 60 or len(m30) < 60:
+    if len(d1) < 60 or len(h4) < 60 or len(h1) < 60:
         return None
-    return d1, h4, h1, m30
+    return d1, h4, h1
 
 # ── indicators ──────────────────────────────────────────────────────────────
 def ema(s: pd.Series, n: int) -> pd.Series:
@@ -151,28 +154,6 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     h, l, c = df["high"], df["low"], df["close"]
     tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
     return tr.ewm(span=n, adjust=False).mean()
-
-def swings(df: pd.DataFrame, k: int = 5):
-    """Return (swing_highs, swing_lows) as lists of (positional_index, price)."""
-    h = df["high"].values; l = df["low"].values
-    ph, pl = [], []
-    for i in range(k, len(df) - k):
-        if h[i] == max(h[i - k:i + k + 1]):
-            ph.append((i, float(h[i])))
-        if l[i] == min(l[i - k:i + k + 1]):
-            pl.append((i, float(l[i])))
-    return ph, pl
-
-def structure_bias(df: pd.DataFrame, k: int = 5) -> str:
-    """bull = HH+HL, bear = LH+LL, else none (last two swings each side)."""
-    ph, pl = swings(df, k)
-    if len(ph) < 2 or len(pl) < 2:
-        return "none"
-    if ph[-1][1] > ph[-2][1] and pl[-1][1] > pl[-2][1]:
-        return "bull"
-    if ph[-1][1] < ph[-2][1] and pl[-1][1] < pl[-2][1]:
-        return "bear"
-    return "none"
 
 def trend_bias(df: pd.DataFrame) -> str:
     """bull / bear / none from EMA structure + slope + price location."""
@@ -269,38 +250,30 @@ def session_label() -> str | None:
     return None
 
 # ── scoring ─────────────────────────────────────────────────────────────────
-def score_setup(sig, struct_ok, rr2, in_session) -> int:
-    s = 45                                   # HTF (D1+H4) aligned + valid trigger
-    s += 18 if sig["kind"] == "Engulfing" else 10
-    s += 12                                   # pullback into value (required)
-    s += 6 if sig["deep"] else 0             # deeper retrace to EMA50
-    s += 8 if sig["momentum"] else 0
-    s += 12 if struct_ok else 0
-    s += 5 if in_session else 0
-    s += 7 if rr2 >= 3 else 3                 # rr2 always >= RR_MIN here
+def score_setup(sig, in_session) -> int:
+    # struct_ok is a required gate (checked before this call), not a bonus.
+    # All signals reaching here have: HTF bias, 1H structure, valid candle, pullback, momentum.
+    # Remaining discriminators spread the 80-100 range:
+    s = 72                                        # base passing all hard gates
+    s += 12 if sig["kind"] == "Engulfing" else 0  # engulfing carries more weight than pin bar
+    s += 9  if sig["deep"] else 0                 # deep retrace to EMA50 = stronger setup
+    s += 7  if in_session else 0                  # London or NY session overlap
     return min(100, s)
 
 # ── formatting ──────────────────────────────────────────────────────────────
 def fmt_price(x: float, pip: float) -> str:
-    digits = 0 if x >= 1000 else (2 if pip >= 0.1 else (3 if pip >= 0.01 else 5))
+    if pip >= 1.0:    # BTCUSD — integer
+        digits = 0
+    elif pip >= 0.1:  # XAUUSD — 1 decimal
+        digits = 1
+    elif pip >= 0.01: # JPY pairs — 3 decimals
+        digits = 3
+    else:             # standard 4-decimal FX pairs — 5 decimals
+        digits = 5
     return f"{x:.{digits}f}"
-
-SEP = "━" * 18
 
 def sym_disp(name: str) -> str:
     return f"{name[:3]}/{name[3:]}" if len(name) == 6 else name
-
-def pbar(pct: float, n: int = 10) -> str:
-    pct = max(0.0, min(100.0, pct))
-    fill = int(round(pct / 100 * n))
-    return "█" * fill + "░" * (n - fill)
-
-def fmt_dt(ts) -> str:
-    try:
-        d = pd.Timestamp(ts).to_pydatetime()
-    except Exception:
-        d = dt.datetime.now(dt.timezone.utc)
-    return d.strftime("%d %b %Y | %H:%M")
 
 def fmt_dur(a, b) -> str:
     try:
@@ -328,13 +301,13 @@ def build_alert(name, tf, direction, sig, tp1, tp2, rr2, conf, pip, bias_txt,
         f"🎯 TP2: {p(tp2)}\n"
         f"📊 R:R — 1:{rr2:g}\n"
         f"⏰ {sess}\n"
-        f"✅ Confirmed — High Volume + {pa}\n"
+        f"✅ Confirmed — {pa} + Structure Aligned\n"
         f"{score_arrow} Setup Score: {conf}%  (rule-based)"
     )
 
 # ── per-symbol analysis ─────────────────────────────────────────────────────
 def analyse_frames(name: str, frames, pip: float):
-    d1, h4, h1, m30 = frames
+    d1, h4, h1 = frames
     bias_d, bias_h4 = trend_bias(d1), trend_bias(h4)
     if bias_d == "none" or bias_d != bias_h4:        # HTF must agree
         return None
@@ -361,13 +334,16 @@ def analyse_frames(name: str, frames, pip: float):
         rr2 = abs(tp2 - sig["entry"]) / risk
         if rr2 < RR_MIN:
             continue
+        # 1H structure must confirm the HTF direction — hard gate, not a bonus
         struct_ok = clean_structure(df, direction)
+        if not struct_ok:
+            log(f"  {name}: 1H structure not confirming {direction} — skip")
+            continue
         in_sess = session_label() is not None
-        conf = score_setup(sig, struct_ok, rr2, in_sess)
+        conf = score_setup(sig, in_sess)
         if conf < CONF_THRESHOLD:
             continue
-        bias_txt = (f"D1 {bias_d.upper()} + H4 {bias_h4.upper()} aligned"
-                    f"{' · clean structure' if struct_ok else ''}")
+        bias_txt = f"D1 {bias_d.upper()} + H4 {bias_h4.upper()} aligned · 1H structure confirmed"
         invalid = ("Close beyond stop / loss of " +
                    ("HL" if direction == "BUY" else "LH") + " structure")
         sig_time = str(df.index[-2])
@@ -708,6 +684,11 @@ def run_scan(symbols=None, dry=False):
     cooldowns = load_json(COOLDOWNS, {})
     targets = symbols or list(WATCHLIST.keys())
     found, sent, flips = 0, 0, 0
+    today_str = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+    signals_today = sum(
+        1 for v in state.values()
+        if isinstance(v, dict) and v.get("sent_at", "").startswith(today_str)
+    )
     for name in targets:
         if name not in WATCHLIST:
             log(f"skip unknown symbol {name}")
@@ -717,7 +698,7 @@ def run_scan(symbols=None, dry=False):
         if not frames:
             log(f"{name}: data unavailable")
             continue
-        d1, h4, h1, m30 = frames
+        d1, h4, h1 = frames
 
         # ── trend-change detection: alert when the agreed Daily+4H bias flips ──
         ob = overall_bias(d1, h4)
@@ -777,6 +758,9 @@ def run_scan(symbols=None, dry=False):
                           setup["tp1"], setup["tp2"], setup["rr2"], setup["conf"],
                           setup["pip"], setup["bias_txt"], setup["invalidation"])
         log(f"{name}: SIGNAL {setup['direction']} {setup['tf']} score={setup['conf']}%")
+        if signals_today >= MAX_SIGNALS_PER_DAY:
+            log(f"daily signal cap ({MAX_SIGNALS_PER_DAY}) reached — skipping {name}")
+            continue
         if dry:
             print("\n" + msg + "\n")
         else:
@@ -788,6 +772,7 @@ def run_scan(symbols=None, dry=False):
                 save_json(COOLDOWNS, cooldowns)
                 record_trade(setup)            # log it as an open trade to track TP/SL
                 sent += 1
+                signals_today += 1
         time.sleep(0.4)
     log(f"scan complete: {len(targets)} scanned, {found} setups, {sent} alerts, {flips} trend-changes")
     return found, sent

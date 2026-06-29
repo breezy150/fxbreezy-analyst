@@ -1,0 +1,70 @@
+name: FxBreezy Scanner
+
+on:
+  schedule:
+    # Every 30 minutes, Mon–Fri, 07:00–21:00 UTC (London + NY sessions)
+    - cron: "0,30 7-20 * * 1-5"
+    # Also run at 21:00 to catch late NY closes
+    - cron: "0 21 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (print signals, don't send to Telegram)"
+        required: false
+        default: "false"
+      symbols:
+        description: "Comma-separated symbols to scan (leave blank for full watchlist)"
+        required: false
+        default: ""
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # needed to commit state files back
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          # Use a PAT so the bot can push state files back
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: fxbreezy_bot/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r fxbreezy_bot/requirements.txt
+
+      - name: Run scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            DRY="--dry"
+          else
+            DRY=""
+          fi
+          if [ -n "${{ github.event.inputs.symbols }}" ]; then
+            SYMS="--symbols ${{ github.event.inputs.symbols }}"
+          else
+            SYMS=""
+          fi
+          python fxbreezy_bot/scanner.py $DRY $SYMS
+
+      - name: Save state files back to repo
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          git config user.name  "FxBreezy Bot"
+          git config user.email "bot@fxbreezy.local"
+          git add fxbreezy_bot/state.json \
+                  fxbreezy_bot/trades.json \
+                  fxbreezy_bot/cooldowns.json \
+                  fxbreezy_bot/bias_state.json || true
+          git diff --cached --quiet || git commit -m "bot: state update $(date -u '+%Y-%m-%d %H:%M') UTC"
+          git push || true
