@@ -4,10 +4,14 @@ FxBreezy Autonomous Market Analyst
 ----------------------------------
 Runs the user's trading framework end-to-end, with no human in the loop:
 
-  1. For every watchlist instrument, pull Daily / 4H / 1H / 30M candles (Yahoo, free).
+  1. Every pair in the watchlist trades — no pair blacklist. Pull Daily / 4H /
+     1H / 30M candles (Yahoo, free).
   2. Establish higher-timeframe bias: Daily AND 4H must agree (trend or skip).
-  3. Hunt a trend-CONTINUATION entry on 1H / 30M: pullback into value + a
-     confirmation candle (engulfing / pin) + momentum, in the HTF direction.
+     This is the hard trend-follow gate — quality is enforced per-signal here
+     and by the structure/reversal check below, not by excluding instruments.
+  3. Hunt a trend-CONTINUATION entry on the 30M: pullback into value + a
+     reversal confirmation candle (engulfing / pin) + momentum, in the HTF
+     direction. 30M swing structure must also confirm before a signal is scored.
   4. Size the trade: structure/ATR stop, TP1 + TP2, require R:R >= 2 (prefer 3+).
   5. Score confidence 0-100. Only setups >= 80% are sent.
   6. Push the alert to Telegram in the fixed format, de-duplicated so each
@@ -66,8 +70,13 @@ WATCHLIST = {
     "AUDUSD":  ("AUDUSD=X", 0.0001),
     "AUDJPY":  ("AUDJPY=X", 0.01),
     "EURJPY":  ("EURJPY=X", 0.01),
+    "AUDCAD":  ("AUDCAD=X", 0.0001),
+    "GBPCAD":  ("GBPCAD=X", 0.0001),
+    "EURUSD":  ("EURUSD=X", 0.0001),
 }
-# Removed: EURUSD (0W 2L 1BE, -2R), GBPCAD (0W 4L, -4R), AUDCAD (0W 5L 1BE, -5R)
+# Full 20-pair watchlist — every pair trades. Quality is enforced per-signal by
+# the D1+H4 trend-sync gate and the 30M reversal/structure confirmation below,
+# not by a static pair blacklist.
 
 # ── small utils ─────────────────────────────────────────────────────────────
 def log(msg: str) -> None:
@@ -139,12 +148,13 @@ def to_h4(df1h: pd.DataFrame) -> pd.DataFrame:
 def get_frames(ticker: str):
     d1 = fetch(ticker, "1d", "2y")
     h1 = fetch(ticker, "60m", "60d")
-    if d1 is None or h1 is None:
+    m30 = fetch(ticker, "30m", "60d")
+    if d1 is None or h1 is None or m30 is None:
         return None
     h4 = to_h4(h1)
-    if len(d1) < 60 or len(h4) < 60 or len(h1) < 60:
+    if len(d1) < 60 or len(h4) < 60 or len(h1) < 60 or len(m30) < 60:
         return None
-    return d1, h4, h1
+    return d1, h4, h1, m30
 
 # ── indicators ──────────────────────────────────────────────────────────────
 def ema(s: pd.Series, n: int) -> pd.Series:
@@ -307,13 +317,13 @@ def build_alert(name, tf, direction, sig, tp1, tp2, rr2, conf, pip, bias_txt,
 
 # ── per-symbol analysis ─────────────────────────────────────────────────────
 def analyse_frames(name: str, frames, pip: float):
-    d1, h4, h1 = frames
+    d1, h4, h1, m30 = frames
     bias_d, bias_h4 = trend_bias(d1), trend_bias(h4)
-    if bias_d == "none" or bias_d != bias_h4:        # HTF must agree
+    if bias_d == "none" or bias_d != bias_h4:        # Daily + 4H must agree — hard trend gate
         return None
     direction = "BUY" if bias_d == "bull" else "SELL"
 
-    for tf_name, df in (("1H", h1),):     # 1H only — 30M dropped (too noisy per trade-log analysis)
+    for tf_name, df in (("30M", m30),):   # entries hunted on 30M: pullback + reversal candle, in HTF trend direction
         sig = candle_signal(df, direction)
         if not sig:
             continue
@@ -334,16 +344,16 @@ def analyse_frames(name: str, frames, pip: float):
         rr2 = abs(tp2 - sig["entry"]) / risk
         if rr2 < RR_MIN:
             continue
-        # 1H structure must confirm the HTF direction — hard gate, not a bonus
+        # 30M structure must confirm the HTF direction — hard gate, not a bonus
         struct_ok = clean_structure(df, direction)
         if not struct_ok:
-            log(f"  {name}: 1H structure not confirming {direction} — skip")
+            log(f"  {name}: 30M structure not confirming {direction} — skip")
             continue
         in_sess = session_label() is not None
         conf = score_setup(sig, in_sess)
         if conf < CONF_THRESHOLD:
             continue
-        bias_txt = f"D1 {bias_d.upper()} + H4 {bias_h4.upper()} aligned · 1H structure confirmed"
+        bias_txt = f"D1 {bias_d.upper()} + H4 {bias_h4.upper()} aligned · 30M structure confirmed"
         invalid = ("Close beyond stop / loss of " +
                    ("HL" if direction == "BUY" else "LH") + " structure")
         sig_time = str(df.index[-2])
@@ -698,7 +708,7 @@ def run_scan(symbols=None, dry=False):
         if not frames:
             log(f"{name}: data unavailable")
             continue
-        d1, h4, h1 = frames
+        d1, h4, h1, m30 = frames
 
         # ── trend-change detection: alert when the agreed Daily+4H bias flips ──
         ob = overall_bias(d1, h4)
