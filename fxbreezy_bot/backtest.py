@@ -122,11 +122,12 @@ def in_session_hour(hr: int) -> bool:
 
 
 # ── outcome simulation (mirror of monitor_trades) ───────────────────────────
-def simulate(df, i, direction, entry, sl, tp_mult):
-    """Walk bars from i forward. Returns (result, r_multiple) or None if unresolved."""
+def simulate(df, i, direction, entry, sl, tp_mult, be_trigger=1.0):
+    """Walk bars from i forward. Returns (result, r_multiple) or None if unresolved.
+    be_trigger: R-multiple at which the stop moves to breakeven (live = 1.0 = TP1)."""
     risk = abs(entry - sl)
     buy = direction == "BUY"
-    tp1 = entry + risk if buy else entry - risk
+    tp1 = entry + risk * be_trigger if buy else entry - risk * be_trigger
     tp2 = entry + risk * tp_mult if buy else entry - risk * tp_mult
     stop, tp1_hit = sl, False
     for j in range(i, len(df)):
@@ -142,14 +143,23 @@ def simulate(df, i, direction, entry, sl, tp_mult):
     return None                                          # still open at data end
 
 
-# ── candidate generation per symbol ─────────────────────────────────────────
-def gen_candidates(name, entry_tf="30m"):
+# ── data loading (shared between entry engines) ─────────────────────────────
+def load_data(name, entry_tf="30m"):
     ticker, pip = WATCHLIST[name]
     d1 = fetch(ticker, "1d", "2y")
     h1 = fetch(ticker, "60m", "60d")
     df = h1 if entry_tf == "60m" else fetch(ticker, "30m", "60d")
     if d1 is None or h1 is None or df is None or len(df) < WARMUP_BARS + 20:
+        return None
+    return d1, h1, df
+
+
+# ── candidate generation per symbol ─────────────────────────────────────────
+def gen_candidates(name, entry_tf="30m", data=None):
+    data = data or load_data(name, entry_tf)
+    if data is None:
         return [], None
+    d1, h1, df = data
     h4 = to_h4(h1)
     htf = HTFBias(d1, h4)
     e20, e50, a = ema(df["close"], 20), ema(df["close"], 50), atr(df, 14)
@@ -179,9 +189,111 @@ def gen_candidates(name, entry_tf="30m"):
     return out, df
 
 
+# ── break-and-retest entry engine (candidate strategy) ──────────────────────
+# BUY: price breaks a confirmed 30M swing high (BOS in trend direction), then
+# retests the broken level within RETEST_WINDOW bars, holds it (shallow
+# penetration only), and prints a bullish close back above it -> entry.
+PIVOT_K        = 3     # bars each side for a confirmed swing
+RETEST_WINDOW  = 24    # bars after breakout in which a retest is valid (12h)
+TOUCH_BUF      = 0.10  # ATRs above level that still counts as a touch
+MAX_PEN        = 0.50  # ATRs a retest may penetrate the level before it's failed
+MIN_RISK_ATR   = 0.40  # floor on stop distance (spread/noise protection)
+
+def gen_candidates_retest(name, data=None):
+    data = data or load_data(name, "30m")
+    if data is None:
+        return [], None
+    d1, h1, df = data
+    h4 = to_h4(h1)
+    htf = HTFBias(d1, h4)
+    a = atr(df, 14)
+    hi, lo, cl, op = (df["high"].values, df["low"].values,
+                      df["close"].values, df["open"].values)
+    n = len(df)
+    # precompute confirmed pivots (pivot at p is knowable from bar p+K onward)
+    piv_hi = [p for p in range(PIVOT_K, n - PIVOT_K)
+              if hi[p] == max(hi[p - PIVOT_K:p + PIVOT_K + 1])]
+    piv_lo = [p for p in range(PIVOT_K, n - PIVOT_K)
+              if lo[p] == min(lo[p - PIVOT_K:p + PIVOT_K + 1])]
+
+    out = []
+    pending = None            # active breakout waiting for its retest
+    used_level = None
+    ih, il = 0, 0             # pivot pointers
+    level_hi = level_lo = None
+    for i in range(WARMUP_BARS, n):
+        t = df.index[i]
+        ob = htf.at(t, cl[i - 1])
+        if ob == "none":
+            pending = None
+            continue
+        direction = "BUY" if ob == "bull" else "SELL"
+        # most recent pivot confirmed as of bar i-1 (needs PIVOT_K closes after it)
+        while ih < len(piv_hi) and piv_hi[ih] + PIVOT_K <= i - 1:
+            level_hi = hi[piv_hi[ih]]; ih += 1
+        while il < len(piv_lo) and piv_lo[il] + PIVOT_K <= i - 1:
+            level_lo = lo[piv_lo[il]]; il += 1
+
+        av = a.iloc[i - 1]
+        if pd.isna(av) or av <= 0:
+            continue
+
+        if direction == "BUY":
+            level = level_hi
+            if pending and pending["dir"] != "BUY":
+                pending = None
+            # new breakout: close crosses above the confirmed swing high
+            if (pending is None and level is not None and level != used_level
+                    and cl[i - 1] > level and cl[i - 2] <= level):
+                pending = dict(dir="BUY", level=level, bar=i - 1, rlow=None)
+                continue
+            if pending:
+                L = pending["level"]
+                if i - 1 - pending["bar"] > RETEST_WINDOW or cl[i - 1] < L - MAX_PEN * av:
+                    used_level, pending = L, None          # expired or level failed
+                    continue
+                if i - 1 > pending["bar"] and lo[i - 1] <= L + TOUCH_BUF * av:
+                    pending["rlow"] = min(pending["rlow"] or lo[i - 1], lo[i - 1])
+                if (pending["rlow"] is not None
+                        and cl[i - 1] > op[i - 1] and cl[i - 1] > L):
+                    entry = cl[i - 1]
+                    sl = min(pending["rlow"], L) - 0.15 * av
+                    sl = min(sl, entry - MIN_RISK_ATR * av)
+                    out.append(dict(symbol=name, i=i, time=t, direction="BUY",
+                                    entry=entry, sl=sl, kind="Retest",
+                                    conf=85, hour=t.hour))
+                    used_level, pending = L, None
+        else:
+            level = level_lo
+            if pending and pending["dir"] != "SELL":
+                pending = None
+            if (pending is None and level is not None and level != used_level
+                    and cl[i - 1] < level and cl[i - 2] >= level):
+                pending = dict(dir="SELL", level=level, bar=i - 1, rhigh=None)
+                continue
+            if pending:
+                L = pending["level"]
+                if i - 1 - pending["bar"] > RETEST_WINDOW or cl[i - 1] > L + MAX_PEN * av:
+                    used_level, pending = L, None
+                    continue
+                if i - 1 > pending["bar"] and hi[i - 1] >= L - TOUCH_BUF * av:
+                    pending["rhigh"] = max(pending["rhigh"] or hi[i - 1], hi[i - 1])
+                if (pending["rhigh"] is not None
+                        and cl[i - 1] < op[i - 1] and cl[i - 1] < L):
+                    entry = cl[i - 1]
+                    sl = max(pending["rhigh"], L) + 0.15 * av
+                    sl = max(sl, entry + MIN_RISK_ATR * av)
+                    out.append(dict(symbol=name, i=i, time=t, direction="SELL",
+                                    entry=entry, sl=sl, kind="Retest",
+                                    conf=85, hour=t.hour))
+                    used_level, pending = L, None
+    return out, df
+
+
 # ── portfolio pass: cooldown + daily cap, then outcomes ─────────────────────
 def run_variant(cands_by_sym, frames, session_gate=False, tp_mult=2.0,
-                cooldown_h=COOLDOWN_HOURS, daily_cap=MAX_SIGNALS_PER_DAY):
+                cooldown_h=COOLDOWN_HOURS, daily_cap=MAX_SIGNALS_PER_DAY,
+                be_trigger=1.0):
     all_c = sorted([c for cl in cands_by_sym.values() for c in cl],
                    key=lambda c: c["time"])
     last_fire: dict = {}
@@ -197,7 +309,7 @@ def run_variant(cands_by_sym, frames, session_gate=False, tp_mult=2.0,
         if day_count.get(day, 0) >= daily_cap:
             continue
         res = simulate(frames[c["symbol"]], c["i"], c["direction"],
-                       c["entry"], c["sl"], tp_mult)
+                       c["entry"], c["sl"], tp_mult, be_trigger)
         last_fire[c["symbol"]] = c["time"]
         day_count[day] = day_count.get(day, 0) + 1
         if res is None:
@@ -227,30 +339,32 @@ def main():
             if args.symbols else list(WATCHLIST.keys()))
 
     print(f"Generating candidates for {len(syms)} symbols "
-          f"(30M + 1H frames, ~60d window)...")
-    c30, f30, c60, f60 = {}, {}, {}, {}
+          f"(30M pullback + 30M break-and-retest, ~60d window)...")
+    cP, cR, f30 = {}, {}, {}
     for n in syms:
-        c30[n], f30[n] = gen_candidates(n, "30m")
+        data = load_data(n, "30m")
+        cP[n], f30[n] = gen_candidates(n, "30m", data=data)
+        cR[n], _ = gen_candidates_retest(n, data=data)
         time.sleep(0.2)
-        c60[n], f60[n] = gen_candidates(n, "60m")
-        time.sleep(0.2)
-        print(f"  {n}: {len(c30[n])} 30M candidates, {len(c60[n])} 1H candidates")
+        print(f"  {n}: {len(cP[n])} pullback, {len(cR[n])} retest candidates")
 
     f30 = {k: v for k, v in f30.items() if v is not None}
-    f60 = {k: v for k, v in f60.items() if v is not None}
+    combo = {n: cP.get(n, []) + cR.get(n, []) for n in f30}
 
-    print("\n=== VARIANTS (same window, same rules unless stated) ===")
+    print("\n=== VARIANTS (same window, same trend gate, same management) ===")
     results = {}
-    results["A"] = report("A: LIVE 30M, all pairs",
-                          run_variant(c30, f30))
-    results["B"] = report("B: 30M + session gate 07-21 UTC",
-                          run_variant(c30, f30, session_gate=True))
-    results["C"] = report("C: 1H entries (old strategy)",
-                          run_variant(c60, f60))
-    results["D"] = report("D: 1H + session gate",
-                          run_variant(c60, f60, session_gate=True))
-    results["E"] = report("E: 30M + session + TP2=3R",
-                          run_variant(c30, f30, session_gate=True, tp_mult=3.0))
+    results["A"] = report("A: LIVE 30M pullback (baseline)",
+                          run_variant(cP, f30))
+    results["F"] = report("F: 30M break-and-retest",
+                          run_variant(cR, f30))
+    results["G"] = report("G: combo (pullback + retest)",
+                          run_variant(combo, f30))
+    results["H"] = report("H: pullback, BE at 1.5R",
+                          run_variant(cP, f30, be_trigger=1.5))
+    results["I"] = report("I: retest, BE at 1.5R",
+                          run_variant(cR, f30, be_trigger=1.5))
+    results["J"] = report("J: combo, BE at 1.5R",
+                          run_variant(combo, f30, be_trigger=1.5))
 
     with open("backtest_results.json", "w", encoding="utf-8") as fh:
         json.dump(results, fh, indent=2)
