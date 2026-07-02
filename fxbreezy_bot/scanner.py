@@ -459,6 +459,7 @@ def record_trade(setup: dict) -> None:
         "conf": setup["conf"], "opened_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "sig_time": setup["sig_time"], "last_checked": setup["sig_time"],
         "status": "open", "stop": s["sl"], "tp1_hit": False,
+        "kind": s.get("kind"), "session": session_label() or "off-session",
     })
     save_json(TRADES, trades)
 
@@ -689,6 +690,12 @@ def price_alert_msg(name, level, direction, note, pip) -> str:
 def run_scan(symbols=None, dry=False):
     monitor_trades(dry)                       # update open trades & fire TP/SL alerts first
     state = load_json(STATE, {})
+    # prune dedup entries older than 7 days (freshness gate makes them unreachable anyway)
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)).isoformat()
+    stale = [k for k, v in state.items()
+             if isinstance(v, dict) and v.get("sent_at", "9999") < cutoff]
+    for k in stale:
+        del state[k]
     biases = load_json(BIASES, {})
     palerts = load_json(ALERTS, {})
     cooldowns = load_json(COOLDOWNS, {})
@@ -696,8 +703,9 @@ def run_scan(symbols=None, dry=False):
     found, sent, flips = 0, 0, 0
     today_str = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
     signals_today = sum(
-        1 for v in state.values()
-        if isinstance(v, dict) and v.get("sent_at", "").startswith(today_str)
+        1 for k, v in state.items()
+        if (":BUY:" in k or ":SELL:" in k)          # gap reports etc. don't count
+        and isinstance(v, dict) and v.get("sent_at", "").startswith(today_str)
     )
     for name in targets:
         if name not in WATCHLIST:

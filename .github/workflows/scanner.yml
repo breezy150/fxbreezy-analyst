@@ -2,10 +2,11 @@ name: FxBreezy Scanner
 
 on:
   schedule:
-    # Every 30 minutes, Mon–Fri, 07:00–21:00 UTC (London + NY sessions)
-    - cron: "0,30 7-20 * * 1-5"
-    # Also run at 21:00 to catch late NY closes
-    - cron: "0 21 * * 1-5"
+    # Every 30 minutes, 24h Mon–Fri — backtest showed off-session (Asia) signals
+    # are net-positive under the 30M strategy; the old 07–21 window left R on the table
+    - cron: "0,30 * * * 1-5"
+    # Weekends: BTCUSD only (the one 24/7 instrument) + keeps open-trade monitoring alive
+    - cron: "0,30 * * * 0,6"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -52,6 +53,8 @@ jobs:
           fi
           if [ -n "${{ github.event.inputs.symbols }}" ]; then
             SYMS="--symbols ${{ github.event.inputs.symbols }}"
+          elif [ "${{ github.event.schedule }}" = "0,30 * * * 0,6" ]; then
+            SYMS="--symbols BTCUSD"   # weekend runs: only crypto trades
           else
             SYMS=""
           fi
@@ -67,4 +70,5 @@ jobs:
                   fxbreezy_bot/cooldowns.json \
                   fxbreezy_bot/bias_state.json || true
           git diff --cached --quiet || git commit -m "bot: state update $(date -u '+%Y-%m-%d %H:%M') UTC"
+          git pull --rebase --autostash || true
           git push || true
